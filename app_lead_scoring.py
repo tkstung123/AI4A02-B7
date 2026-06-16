@@ -9,6 +9,26 @@ from dotenv import load_dotenv
 # Load các biến môi trường từ .env
 load_dotenv()
 
+# Tự động đồng bộ credentials.json sang .streamlit/secrets.toml nếu chạy ở local
+if os.path.exists("credentials.json") and not os.path.exists(".streamlit/secrets.toml"):
+    try:
+        os.makedirs(".streamlit", exist_ok=True)
+        with open("credentials.json", "r", encoding="utf-8") as f:
+            creds = json.load(f)
+        toml_content = "[connections.gsheets]\n"
+        for k, v in creds.items():
+            if k == "private_key":
+                toml_content += f'private_key = """{v}"""\n'
+            elif isinstance(v, str):
+                escaped_v = v.replace('"', '\\"')
+                toml_content += f'{k} = "{escaped_v}"\n'
+            else:
+                toml_content += f'{k} = {json.dumps(v)}\n'
+        with open(".streamlit/secrets.toml", "w", encoding="utf-8") as f:
+            f.write(toml_content)
+    except Exception as e:
+        pass
+
 # Page configuration
 st.set_page_config(page_title="Real Estate Lead Scoring AI", page_icon="🏡", layout="wide")
 
@@ -37,17 +57,64 @@ st.markdown("""
 
 # Helper Functions
 def load_data_from_url(sheet_url):
-    """Tải dữ liệu từ Google Sheet công khai (Anyone with the link can view)"""
+    """Tải dữ liệu từ Google Sheet (ưu tiên dùng Streamlit Secrets, sau đó đến credentials.json)"""
     try:
-        if "/edit" in sheet_url:
-            csv_url = sheet_url.split("/edit")[0] + "/export?format=csv"
-        elif "/pubhtml" in sheet_url:
-            csv_url = sheet_url.split("/pubhtml")[0] + "/pub?output=csv"
+        secret_dict = None
+        
+        # 1. Ưu tiên đọc từ Streamlit Secrets (connections.gsheets)
+        if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+            secret_dict = dict(st.secrets["connections"]["gsheets"])
+        # 2. Dự phòng đọc từ file credentials.json cục bộ
+        elif os.path.exists("credentials.json"):
+            with open("credentials.json", "r", encoding="utf-8") as f:
+                secret_dict = json.load(f)
+                
+        # Nếu tìm thấy thông tin xác thực, kết nối qua gspread
+        if secret_dict:
+            import gspread
+            from google.oauth2.service_account import Credentials
+            
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+            
+            # Chuẩn hóa private key (tránh lỗi định dạng PEM khi copy-paste)
+            if "private_key" in secret_dict and isinstance(secret_dict["private_key"], str):
+                pk_cleaned = secret_dict["private_key"].replace("\\n", "\n")
+                pk_lines = [line.strip() for line in pk_cleaned.split("\n") if line.strip()]
+                secret_dict["private_key"] = "\n".join(pk_lines)
+                
+            creds = Credentials.from_service_account_info(secret_dict, scopes=scopes)
+            client = gspread.authorize(creds)
+            
+            sheet = client.open_by_url(sheet_url)
+            worksheet = sheet.get_worksheet(0)
+            
+            # Đọc dữ liệu thành DataFrame
+            all_values = worksheet.get_all_values()
+            if not all_values:
+                return pd.DataFrame()
+            
+            headers = all_values[0]
+            rows = all_values[1:]
+            return pd.DataFrame(rows, columns=headers)
         else:
-            csv_url = sheet_url
-        return pd.read_csv(csv_url)
+            # Nếu không cấu hình credentials, tải công khai dạng CSV
+            if "/edit" in sheet_url:
+                csv_url = sheet_url.split("/edit")[0] + "/export?format=csv"
+            elif "/pubhtml" in sheet_url:
+                csv_url = sheet_url.split("/pubhtml")[0] + "/pub?output=csv"
+            else:
+                csv_url = sheet_url
+            return pd.read_csv(csv_url)
     except Exception as e:
-        raise ValueError(f"Không thể đọc Google Sheet. Hãy đảm bảo Sheet được cấu hình công khai. Lỗi: {e}")
+        raise ValueError(
+            f"Không thể đọc Google Sheet. "
+            f"Vui lòng đảm bảo cấu hình Streamlit Secrets (connections.gsheets) hoặc file credentials.json hợp lệ "
+            f"và tài khoản Service Account đã có quyền Viewer trên Sheet. "
+            f"Lỗi chi tiết: {e}"
+        )
 
 def load_scoring_skill():
     """Tải tiêu chí chấm điểm từ file markdown"""
